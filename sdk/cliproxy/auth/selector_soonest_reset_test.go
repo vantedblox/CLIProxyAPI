@@ -241,3 +241,145 @@ func TestSoonestResetManagerLearnsResetsFromResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestSoonestResetObservedWithoutWindowsIsNotProbedForever(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	retryAfterOnly := &Auth{ID: "a-retry-after", Provider: "claude", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"Retry-After": "30"}}}
+	codexCredits := &Auth{ID: "b-codex-credits", Provider: "codex", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{"X-Codex-Plan-Type": "credits", "X-Codex-Credits-Balance": "12"}}}
+	for _, auth := range []*Auth{retryAfterOnly, codexCredits} {
+		if rank := rankSoonestReset(auth, now); rank.tier != soonestResetTierUnobservable {
+			t.Fatalf("%s rank = %+v, want unobservable tier", auth.ID, rank)
+		}
+	}
+	healthy := claudeAuth("z-healthy", now.Add(100*time.Hour), nil)
+	if got := pickID(t, "claude", retryAfterOnly, healthy); got != "z-healthy" {
+		t.Fatalf("picked %q, want z-healthy", got)
+	}
+}
+
+// Issue #6465 header shape: an account billing extra usage sends no 5h/7d headers.
+func overageInUseAuth(id string, now time.Time) *Auth {
+	return &Auth{ID: id, Provider: "claude", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "allowed",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "overage",
+		"Anthropic-Ratelimit-Unified-Reset":                unix(now.Add(25 * 24 * time.Hour)),
+		"Anthropic-Ratelimit-Unified-Overage-In-Use":       "true",
+		"Anthropic-Ratelimit-Unified-Overage-Status":       "allowed",
+		"Anthropic-Ratelimit-Unified-Overage-Reset":        unix(now.Add(25 * 24 * time.Hour)),
+	}}}
+}
+
+func TestSoonestResetDeprioritisesAccountBillingOverage(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	overage := overageInUseAuth("a-overage", now)
+	rank := rankSoonestReset(overage, now)
+	if rank.tier != soonestResetTierExhausted {
+		t.Fatalf("overage rank = %+v, want exhausted tier", rank)
+	}
+	if want := now.Add(5 * time.Hour); !rank.at.Equal(want) {
+		t.Fatalf("overage recovery = %v, want observation + 5h (%v)", rank.at, want)
+	}
+	if got := pickID(t, "claude", overage, claudeAuth("b-healthy", now.Add(150*time.Hour), nil)); got != "b-healthy" {
+		t.Fatalf("picked %q, want b-healthy", got)
+	}
+	// Once the assumed recovery has passed, the account is probed again.
+	if later := rankSoonestReset(overage, now.Add(6*time.Hour)); later.tier != soonestResetTierProbe && later.tier != soonestResetTierUnobservable {
+		t.Fatalf("overage rank 6h later = %+v, want it back in rotation", later)
+	}
+}
+
+func TestSoonestResetFableOnlyRejectionStaysInRotation(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	billing := unix(now.Add(25 * 24 * time.Hour))
+	fableCapped := claudeAuth("a-fable-capped", now.Add(20*time.Hour), map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "rejected",
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":         "rejected",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_oi",
+		"Anthropic-Ratelimit-Unified-Reset":                billing,
+		"Anthropic-Ratelimit-Unified-Overage-Reset":        billing,
+	})
+	if rank := rankSoonestReset(fableCapped, now); rank.tier != soonestResetTierHeadroom {
+		t.Fatalf("Fable-only rejection rank = %+v, want headroom (model cooldown handles Fable)", rank)
+	}
+	if got := pickID(t, "claude", fableCapped, claudeAuth("b-later", now.Add(100*time.Hour), nil)); got != "a-fable-capped" {
+		t.Fatalf("picked %q, want a-fable-capped", got)
+	}
+}
+
+func TestSoonestResetIgnoresBillingBoundaryAfterFiveHourWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	auth := claudeAuth("a-5h-rejected", now.Add(20*time.Hour), map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "rejected",
+		"Anthropic-Ratelimit-Unified-5h-Status":            "rejected",
+		"Anthropic-Ratelimit-Unified-5h-Reset":             unix(now.Add(time.Hour)),
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "five_hour",
+		"Anthropic-Ratelimit-Unified-Reset":                unix(now.Add(600 * time.Hour)),
+	})
+	if rank := rankSoonestReset(auth, now); rank.tier != soonestResetTierExhausted || !rank.at.Equal(time.Unix(now.Add(time.Hour).Unix(), 0)) {
+		t.Fatalf("rank now = %+v, want exhausted until the 5h reset", rank)
+	}
+	if rank := rankSoonestReset(auth, now.Add(6*time.Hour)); rank.tier != soonestResetTierHeadroom {
+		t.Fatalf("rank after the 5h window = %+v, want headroom", rank)
+	}
+}
+
+func TestSoonestResetDropsImplausiblyFarResets(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	auth := claudeAuth("a-far", now.Add(30*24*time.Hour), nil)
+	rank := rankSoonestReset(auth, now)
+	if rank.tier != soonestResetTierHeadroom || !rank.at.Equal(time.Unix(now.Add(2*time.Hour).Unix(), 0)) {
+		t.Fatalf("rank = %+v, want the 5h window once the 30-day 7d reset is dropped", rank)
+	}
+}
+
+// Review scenario: an overage account with the highest ID must not take most requests.
+func TestSoonestResetManagerDoesNotFunnelToOverageAccount(t *testing.T) {
+	manager := NewManager(nil, NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &SoonestResetSelector{}, TTL: time.Hour}), nil)
+	manager.RegisterExecutor(&refreshMockExecutor{id: "claude"})
+	now := time.Now()
+	ids := []string{"srf-ov-a", "srf-ov-b", "srf-ov-z-overage"}
+	for _, id := range ids {
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-test"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		if _, err := manager.Register(context.Background(), &Auth{ID: id, Provider: "claude", Status: StatusActive, Metadata: map[string]any{"access_token": "t"}}); err != nil {
+			t.Fatalf("Register(%s) error = %v", id, err)
+		}
+	}
+	headersFor := func(id string) http.Header {
+		if id == "srf-ov-z-overage" {
+			h := http.Header{}
+			for k, v := range overageInUseAuth(id, now).Quota.Signals {
+				h.Set(k, v)
+			}
+			return h
+		}
+		reset := now.Add(40 * time.Hour)
+		if id == "srf-ov-b" {
+			reset = now.Add(90 * time.Hour)
+		}
+		return http.Header{
+			"Anthropic-Ratelimit-Unified-Status":   []string{"allowed"},
+			"Anthropic-Ratelimit-Unified-7d-Reset": []string{unix(reset)},
+			"Anthropic-Ratelimit-Unified-5h-Reset": []string{unix(now.Add(3 * time.Hour))},
+		}
+	}
+	counts := map[string]int{}
+	for i := 0; i < 50; i++ {
+		picked, _, err := manager.pickNext(context.Background(), "claude", "claude-test", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("pick %d error = %v", i, err)
+		}
+		counts[picked.ID]++
+		ctx := internallogging.WithResponseHeadersHolder(context.Background())
+		internallogging.SetResponseHeaders(ctx, headersFor(picked.ID))
+		manager.MarkResult(ctx, Result{AuthID: picked.ID, Provider: "claude", Model: "claude-test", Success: true})
+	}
+	if counts["srf-ov-z-overage"] > 1 || counts["srf-ov-a"] < 47 {
+		t.Fatalf("pick counts = %v, want the overage account probed at most once and srf-ov-a taking the rest", counts)
+	}
+}

@@ -20,16 +20,17 @@ import (
 //
 // The reset times come from the passive quota snapshot the manager records from
 // upstream response headers (Anthropic unified rate limits, Codex primary/secondary
-// windows). That snapshot is kept in memory only, so a credential is "unobserved"
-// after a restart, when it was just added, or once its last observed reset has
-// passed. Unobserved credentials are picked first so a single request learns their
-// reset time; after that they sort by it like every other credential.
+// windows). That snapshot is kept in memory only, so a credential has no snapshot
+// after a restart or when it was just added, and its snapshot is outdated once its
+// long window has reset. Such credentials are picked first so a single request
+// learns their reset time; after that they sort by it like every other credential.
 //
 // Ranking, best first:
-//  1. unobserved Claude/Codex credentials (probe), by ID
+//  1. Claude/Codex credentials without a snapshot, or past their long reset (probe), by ID
 //  2. credentials with headroom, by soonest long-window reset, then ID
-//  3. credentials without quota observation (API keys, other providers), by ID
-//  4. credentials whose snapshot says a window is exhausted, by soonest recovery, then ID
+//  3. credentials without usable windows (API keys, other providers, snapshots with
+//     no window headers), by ID
+//  4. credentials that are exhausted or billing extra usage, by soonest recovery, then ID
 //
 // Cooldowns and priority tiers are applied before ranking, exactly as for the other
 // built-in strategies, so a credential that hit a 429 still drops out until it recovers.
@@ -99,28 +100,27 @@ func rankSoonestReset(auth *Auth, now time.Time) soonestResetRank {
 	if auth != nil {
 		provider = strings.ToLower(strings.TrimSpace(auth.Provider))
 	}
-	var windows []quotaWindow
-	switch provider {
-	case "claude":
-		windows = claudeQuotaWindows(auth.Quota.Signals)
-	case "codex":
-		windows = codexQuotaWindows(auth.Quota.Signals, auth.Quota.ObservedAt)
-	default:
+	if provider != "claude" && provider != "codex" {
 		return soonestResetRank{tier: soonestResetTierUnobservable}
 	}
 	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
 		// API-key credentials are billed per token and report no subscription windows.
 		return soonestResetRank{tier: soonestResetTierUnobservable}
 	}
+	if auth.Quota.ObservedAt.IsZero() {
+		return soonestResetRank{tier: soonestResetTierProbe}
+	}
+	var obs quotaObservation
+	if provider == "claude" {
+		obs = claudeQuotaObservation(auth.Quota.Signals, auth.Quota.ObservedAt, now)
+	} else {
+		obs = codexQuotaObservation(auth.Quota.Signals, auth.Quota.ObservedAt, now)
+	}
 
+	recoverAt := obs.blockedUntil
 	var longest *quotaWindow
-	var recoverAt time.Time
-	for i := range windows {
-		window := &windows[i]
-		if !window.resetAt.After(now) {
-			// A window whose reset has passed says nothing about the current one.
-			continue
-		}
+	for i := range obs.windows {
+		window := &obs.windows[i]
 		if window.exhausted && window.resetAt.After(recoverAt) {
 			recoverAt = window.resetAt
 		}
@@ -129,98 +129,166 @@ func rankSoonestReset(auth *Auth, now time.Time) soonestResetRank {
 		}
 	}
 	switch {
-	case !recoverAt.IsZero():
+	case recoverAt.After(now):
 		return soonestResetRank{tier: soonestResetTierExhausted, at: recoverAt}
 	case longest == nil:
+		// Observed, but the snapshot carries no usable window (Retry-After only,
+		// credits-only plans): rank it like a credential without observation rather
+		// than probing it again on every request.
+		return soonestResetRank{tier: soonestResetTierUnobservable}
+	case !longest.resetAt.After(now):
+		// The long window has reset since it was observed; learn the new one.
 		return soonestResetRank{tier: soonestResetTierProbe}
 	default:
 		return soonestResetRank{tier: soonestResetTierHeadroom, at: longest.resetAt}
 	}
 }
 
-// claudeQuotaWindows reads Anthropic's unified rate-limit headers. Each window reports
-// its reset as Unix seconds; the account-wide status covers rejections that are not
-// attributed to a single window.
-func claudeQuotaWindows(signals map[string]string) []quotaWindow {
-	if len(signals) == 0 {
-		return nil
-	}
+// quotaObservation is what one snapshot says about a credential's subscription windows.
+type quotaObservation struct {
+	windows []quotaWindow
+	// blockedUntil is set when the snapshot blocks the whole credential outside any
+	// single window (an account-wide rejection, or billing extra usage).
+	blockedUntil time.Time
+}
+
+// quotaWindowSkew allows for clock skew when judging whether a reset is plausible.
+// A reset further away than the window length plus this is a billing boundary, not
+// a rate-limit window (the executor applies the same bound).
+const quotaWindowSkew = time.Hour
+
+// claudeQuotaObservation reads Anthropic's unified rate-limit headers. Each window
+// reports its reset as Unix seconds. Rejections that the executor scopes to one model
+// (overage-only or Fable-only "7d_oi") are left to the manager's model cooldown.
+func claudeQuotaObservation(signals map[string]string, observedAt, now time.Time) quotaObservation {
 	const prefix = "anthropic-ratelimit-unified-"
-	var windows []quotaWindow
+	var obs quotaObservation
 	for _, w := range []struct {
 		name   string
 		length time.Duration
 	}{{"5h", 5 * time.Hour}, {"7d", 7 * 24 * time.Hour}} {
 		resetAt, ok := parseQuotaResetTime(quotaSignal(signals, prefix+w.name+"-reset"))
-		if !ok {
+		if !ok || resetAt.Sub(now) > w.length+quotaWindowSkew {
 			continue
 		}
-		windows = append(windows, quotaWindow{
+		obs.windows = append(obs.windows, quotaWindow{
 			length:  w.length,
 			resetAt: resetAt,
 			exhausted: strings.EqualFold(quotaSignal(signals, prefix+w.name+"-status"), "rejected") ||
 				quotaUtilizationFull(quotaSignal(signals, prefix+w.name+"-utilization"), 1),
 		})
 	}
-	if strings.EqualFold(quotaSignal(signals, prefix+"status"), "rejected") {
-		if resetAt, ok := parseQuotaResetTime(quotaSignal(signals, prefix+"reset")); ok {
-			// Zero length: an account-wide rejection marks the credential exhausted
-			// without standing in for the long window used for ordering.
-			windows = append(windows, quotaWindow{resetAt: resetAt, exhausted: true})
+
+	status := strings.ToLower(quotaSignal(signals, prefix+"status"))
+	claim := strings.ToLower(quotaSignal(signals, prefix+"representative-claim"))
+	if status == "rejected" && !claudeRejectionIsModelScoped(signals) {
+		resetAt, ok := parseQuotaResetTime(quotaSignal(signals, prefix+"reset"))
+		overageAt, okOverage := parseQuotaResetTime(quotaSignal(signals, prefix+"overage-reset"))
+		billingBoundary := okOverage && strings.Contains(claim, "overage") && resetAt.Equal(overageAt)
+		if ok && !billingBoundary && resetAt.Sub(now) <= 7*24*time.Hour+quotaWindowSkew {
+			obs.blockedUntil = resetAt
 		}
 	}
-	return windows
+
+	if strings.EqualFold(quotaSignal(signals, prefix+"overage-in-use"), "true") ||
+		(status != "rejected" && strings.Contains(claim, "overage")) {
+		// The account is billing extra usage, so its subscription windows are spent.
+		// Without an exhausted window to say when they come back, assume the shortest
+		// window and look again after it.
+		known := false
+		for _, window := range obs.windows {
+			known = known || window.exhausted
+		}
+		if !known {
+			if until := observedAt.Add(5 * time.Hour); until.After(obs.blockedUntil) {
+				obs.blockedUntil = until
+			}
+		}
+	}
+	return obs
 }
 
-// codexQuotaWindows reads the Codex primary/secondary window headers. Resets arrive
-// either as absolute Unix seconds or as seconds after the observation.
-func codexQuotaWindows(signals map[string]string, observedAt time.Time) []quotaWindow {
-	if len(signals) == 0 {
-		return nil
+// claudeRejectionIsModelScoped mirrors the executor's rule: a unified rejection is
+// overage-only or Fable-only when it is attributed to overage or the 7d_oi claim and
+// the shared 5h and 7d windows still have room.
+func claudeRejectionIsModelScoped(signals map[string]string) bool {
+	const prefix = "anthropic-ratelimit-unified-"
+	status5h := strings.ToLower(quotaSignal(signals, prefix+"5h-status"))
+	status7d := strings.ToLower(quotaSignal(signals, prefix+"7d-status"))
+	if status5h == "rejected" || status7d == "rejected" {
+		return false
 	}
+	claim := strings.ToLower(quotaSignal(signals, prefix+"representative-claim"))
+	if !strings.EqualFold(quotaSignal(signals, prefix+"7d_oi-status"), "rejected") &&
+		!strings.EqualFold(quotaSignal(signals, prefix+"overage-status"), "rejected") &&
+		quotaSignal(signals, prefix+"overage-disabled-reason") == "" &&
+		!strings.Contains(claim, "overage") {
+		return false
+	}
+	allowed := func(status string) bool { return status == "allowed" || status == "allowed_warning" }
+	healthy := func(raw string) bool {
+		value, err := strconv.ParseFloat(raw, 64)
+		return err == nil && value >= 0 && value < 1
+	}
+	util5h := quotaSignal(signals, prefix+"5h-utilization")
+	util7d := quotaSignal(signals, prefix+"7d-utilization")
+	switch {
+	case allowed(status5h) && allowed(status7d):
+		return true
+	case allowed(status7d) && status5h == "" && healthy(util5h):
+		return true
+	case allowed(status5h) && status7d == "" && healthy(util7d):
+		return true
+	case status5h == "" && status7d == "" && strings.Contains(claim, "overage"):
+		return (util5h == "" || healthy(util5h)) && (util7d == "" || healthy(util7d))
+	}
+	return false
+}
+
+// codexQuotaObservation reads the Codex primary/secondary window headers. Resets arrive
+// either as absolute Unix seconds or as seconds after the observation.
+func codexQuotaObservation(signals map[string]string, observedAt, now time.Time) quotaObservation {
 	limitReached := strings.EqualFold(quotaSignal(signals, "x-codex-limit-reached"), "true") ||
 		strings.EqualFold(quotaSignal(signals, "x-codex-allowed"), "false")
-	var windows []quotaWindow
+	var obs quotaObservation
 	for _, name := range []string{"primary", "secondary"} {
 		prefix := "x-codex-" + name + "-"
 		minutes, errMinutes := strconv.ParseInt(quotaSignal(signals, prefix+"window-minutes"), 10, 64)
-		if errMinutes != nil || minutes <= 0 {
+		if errMinutes != nil || minutes <= 0 || minutes > 366*24*60 {
 			continue
 		}
+		length := time.Duration(minutes) * time.Minute
 		resetAt, ok := parseQuotaResetTime(quotaSignal(signals, prefix+"reset-at"))
-		if !ok && !observedAt.IsZero() {
+		if !ok {
 			if after, errAfter := strconv.ParseFloat(quotaSignal(signals, prefix+"reset-after-seconds"), 64); errAfter == nil && after >= 0 && after < math.MaxInt32 {
 				resetAt, ok = observedAt.Add(time.Duration(after*float64(time.Second))), true
 			}
 		}
-		if !ok {
+		if !ok || resetAt.Sub(now) > length+quotaWindowSkew {
 			continue
 		}
-		windows = append(windows, quotaWindow{
-			length:    time.Duration(minutes) * time.Minute,
+		obs.windows = append(obs.windows, quotaWindow{
+			length:    length,
 			resetAt:   resetAt,
 			exhausted: quotaUtilizationFull(quotaSignal(signals, prefix+"used-percent"), 100),
 		})
 	}
-	if limitReached && len(windows) > 0 {
-		// The flag is not tied to a window; the credential is blocked until the
-		// window that resets last among the full ones, or the soonest one if none
-		// reports full usage.
+	if limitReached && len(obs.windows) > 0 {
+		// The flag is not tied to a window. If no window reports full usage, the
+		// soonest reset is the earliest the credential can be usable again.
 		anyExhausted := false
-		for _, window := range windows {
+		soonest := 0
+		for i, window := range obs.windows {
 			anyExhausted = anyExhausted || window.exhausted
+			if window.resetAt.Before(obs.windows[soonest].resetAt) {
+				soonest = i
+			}
 		}
 		if !anyExhausted {
-			soonest := 0
-			for i := range windows {
-				if windows[i].resetAt.Before(windows[soonest].resetAt) {
-					soonest = i
-				}
-			}
-			windows[soonest].exhausted = true
+			obs.windows[soonest].exhausted = true
 		}
 	}
-	return windows
+	return obs
 }
 
 // quotaSignal looks a header up case-insensitively; snapshot keys are canonicalised
