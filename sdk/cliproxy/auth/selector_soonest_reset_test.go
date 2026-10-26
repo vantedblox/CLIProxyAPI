@@ -297,7 +297,7 @@ func TestSoonestResetFableOnlyRejectionStaysInRotation(t *testing.T) {
 	fableCapped := claudeAuth("a-fable-capped", now.Add(20*time.Hour), map[string]string{
 		"Anthropic-Ratelimit-Unified-Status":               "rejected",
 		"Anthropic-Ratelimit-Unified-7d_oi-Status":         "rejected",
-		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_oi",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_overage_included",
 		"Anthropic-Ratelimit-Unified-Reset":                billing,
 		"Anthropic-Ratelimit-Unified-Overage-Reset":        billing,
 	})
@@ -381,5 +381,26 @@ func TestSoonestResetManagerDoesNotFunnelToOverageAccount(t *testing.T) {
 	}
 	if counts["srf-ov-z-overage"] > 1 || counts["srf-ov-a"] < 47 {
 		t.Fatalf("pick counts = %v, want the overage account probed at most once and srf-ov-a taking the rest", counts)
+	}
+}
+
+// Fable draws from its own bucket; its overage claim must not bench the shared windows.
+func TestSoonestResetModelScopedOverageKeepsHealthyAccountInRotation(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fableClaim := claudeAuth("a-fable-claim", now.Add(24*time.Hour), map[string]string{
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_overage_included",
+	})
+	overageInUse := claudeAuth("b-overage-in-use", now.Add(30*time.Hour), map[string]string{
+		"Anthropic-Ratelimit-Unified-Overage-In-Use":       "true",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "overage",
+	})
+	for _, auth := range []*Auth{fableClaim, overageInUse} {
+		if rank := rankSoonestReset(auth, now); rank.tier != soonestResetTierHeadroom {
+			t.Fatalf("%s rank = %+v, want headroom (shared windows have room)", auth.ID, rank)
+		}
+	}
+	if got := pickID(t, "claude", fableClaim, claudeAuth("c-later", now.Add(144*time.Hour), nil)); got != "a-fable-claim" {
+		t.Fatalf("picked %q, want a-fable-claim", got)
 	}
 }

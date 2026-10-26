@@ -190,22 +190,43 @@ func claudeQuotaObservation(signals map[string]string, observedAt, now time.Time
 		}
 	}
 
-	if strings.EqualFold(quotaSignal(signals, prefix+"overage-in-use"), "true") ||
-		(status != "rejected" && strings.Contains(claim, "overage")) {
-		// The account is billing extra usage, so its subscription windows are spent.
-		// Without an exhausted window to say when they come back, assume the shortest
-		// window and look again after it.
-		known := false
+	overage := strings.EqualFold(quotaSignal(signals, prefix+"overage-in-use"), "true") ||
+		(status != "rejected" && claim == "overage")
+	if overage && !claudeSharedWindowsHaveRoom(signals, obs.windows) {
+		// The account is billing extra usage and the snapshot shows no room on the
+		// shared 5h/7d windows, so its subscription is spent. An exhausted window
+		// already says when it comes back; otherwise assume the shortest window and
+		// look again after it. Overage on a model with its own bucket (Fable's
+		// "seven_day_overage_included") leaves the shared windows with room and is
+		// left to the manager's model cooldown.
+		exhaustedWindow := false
 		for _, window := range obs.windows {
-			known = known || window.exhausted
+			exhaustedWindow = exhaustedWindow || window.exhausted
 		}
-		if !known {
+		if !exhaustedWindow {
 			if until := observedAt.Add(5 * time.Hour); until.After(obs.blockedUntil) {
 				obs.blockedUntil = until
 			}
 		}
 	}
 	return obs
+}
+
+// claudeSharedWindowsHaveRoom reports whether the snapshot shows room on the shared
+// 5h or 7d window: a parsed window that is not exhausted, or an allowed status.
+func claudeSharedWindowsHaveRoom(signals map[string]string, windows []quotaWindow) bool {
+	for _, window := range windows {
+		if !window.exhausted {
+			return true
+		}
+	}
+	for _, name := range []string{"5h", "7d"} {
+		switch strings.ToLower(quotaSignal(signals, "anthropic-ratelimit-unified-"+name+"-status")) {
+		case "allowed", "allowed_warning":
+			return true
+		}
+	}
+	return false
 }
 
 // claudeRejectionIsModelScoped mirrors the executor's rule: a unified rejection is
